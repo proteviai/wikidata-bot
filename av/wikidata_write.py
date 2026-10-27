@@ -18,7 +18,10 @@ plain account name fails; WIKIDATA_BOT_PASSWORD). The pilot (887 edits,
         # throttling rules: respect maxlag, stay well under ~1 edit/s)
 
 Only claims whose property the item does not have yet are sent (so a rerun
-after a partial failure is safe); the sitelink likewise.
+after a partial failure is safe); the sitelink likewise. `qs`: an item that
+already cites the book for that page is skipped, unless its statement still
+has the P2699 URL qualifier (made until 2026-10-27) -- then the same
+statement is resent by id without it.
 """
 from __future__ import annotations
 
@@ -42,6 +45,9 @@ UA = {"User-Agent": "KnutuxBot/0.1 (https://www.wikidata.org/wiki/User:KnutuxBot
                     + (f"; {_contact})" if _contact else ")")}
 
 BOOK = "Q141805965"
+ADD_SUMMARY = "aprašyta šaltinyje: Lietuvos apgyventos vietos (1925), lt.wikisource"
+FIX_SUMMARY = ("removing P2699 qualifier that repeats the reference URL "
+               "([[Wikidata:Requests for permissions/Bot/KnutuxBot]])")
 
 
 def item(qid: str) -> dict:
@@ -124,8 +130,8 @@ def parse_qs(path: Path) -> list[tuple[str, dict]]:
     return out
 
 
-def has_same(cur: dict, c: dict) -> bool:
-    """Item already describes-by-source the same book with the same page qualifier."""
+def same_claim(cur: dict, c: dict) -> dict | None:
+    """The item's live P1343 claim for the same book and page qualifier, if any."""
     book = c["mainsnak"]["datavalue"]["value"]["numeric-id"]
     page = c.get("qualifiers", {}).get("P304", [{}])[0].get("datavalue", {}).get("value")
     for x in cur.get("claims", {}).get("P1343", []):
@@ -133,8 +139,28 @@ def has_same(cur: dict, c: dict) -> bool:
             continue
         pages = [q["datavalue"]["value"] for q in x.get("qualifiers", {}).get("P304", [])]
         if page is None or page in pages or not pages:
-            return True
-    return False
+            return x
+    return None
+
+
+def without_url_qualifier(x: dict) -> dict | None:
+    """The claim minus a P2699 qualifier that repeats its reference URL (P854),
+    or None when there is nothing to strip. Statements made until 2026-10-27
+    carried the URL twice; dropped after the RfP review."""
+    ref_urls = {s["datavalue"]["value"] for r in x.get("references", [])
+                for s in r.get("snaks", {}).get("P854", []) if "datavalue" in s}
+    quals = x.get("qualifiers", {})
+    keep = [q for q in quals.get("P2699", []) if q.get("datavalue", {}).get("value") not in ref_urls]
+    if len(keep) == len(quals.get("P2699", [])):
+        return None
+    y = json.loads(json.dumps(x))
+    if keep:
+        y["qualifiers"]["P2699"] = keep
+    else:
+        del y["qualifiers"]["P2699"]
+        if "qualifiers-order" in y:
+            y["qualifiers-order"] = [p for p in y["qualifiers-order"] if p != "P2699"]
+    return y
 
 
 def session() -> requests.Session:
@@ -192,14 +218,18 @@ def edit(s: requests.Session, csrf: str, qid: str, data: dict, summary: str) -> 
 def run_qs(a: argparse.Namespace) -> None:
     rows = parse_qs(Path(a.path))
     s = session()
-    todo = []
+    todo = []  # (qid, claim, summary): a new claim, or an existing one (with its id) to fix
     for qid, c in rows:
-        if has_same(live(s, qid), c):
-            print(f"skip {qid}: already has P1343 -> book")
+        x = same_claim(live(s, qid), c)
+        if x is None:
+            todo.append((qid, c, ADD_SUMMARY))
+        elif (y := without_url_qualifier(x)) is not None:
+            todo.append((qid, y, FIX_SUMMARY))
         else:
-            todo.append((qid, c))
+            print(f"skip {qid}: already has P1343 -> book")
         time.sleep(0.5)
-    print(f"{len(rows)} lines, {len(todo)} to add")
+    fixes = sum(1 for t in todo if t[2] == FIX_SUMMARY)
+    print(f"{len(rows)} lines, {len(todo) - fixes} to add, {fixes} to strip P2699 from")
     if a.max and len(todo) > a.max:
         todo = todo[:a.max]
         print(f"capped at --max {a.max}")
@@ -211,10 +241,9 @@ def run_qs(a: argparse.Namespace) -> None:
     login(s)
     csrf = s.get(API, params={"action": "query", "meta": "tokens", "format": "json"}
                  ).json()["query"]["tokens"]["csrftoken"]
-    for i, (qid, c) in enumerate(todo):
+    for i, (qid, c, summary) in enumerate(todo):
         name = c["qualifiers"]["P1810"][0]["datavalue"]["value"]
-        rev = edit(s, csrf, qid, {"claims": [c]},
-                   "aprašyta šaltinyje: Lietuvos apgyventos vietos (1925), lt.wikisource")
+        rev = edit(s, csrf, qid, {"claims": [c]}, summary)
         print(f"{i + 1}/{len(todo)} {qid} {name} rev {rev}", flush=True)
         if i + 1 < len(todo):
             time.sleep(a.pause)
